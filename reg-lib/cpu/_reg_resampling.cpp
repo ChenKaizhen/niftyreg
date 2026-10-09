@@ -649,6 +649,17 @@ void reg_resampleImage(nifti_image *floatingImage,
         NR_FATAL_ERROR("The floating and warped images have different dimensions along the time axis");
     if (deformationField->datatype != NIFTI_TYPE_FLOAT32 && deformationField->datatype != NIFTI_TYPE_FLOAT64)
         NR_FATAL_ERROR("The deformation field image is expected to be of type float or double");
+    // The resampler is chosen from the field: it walks the warped image in step with the field
+    // and samples the floating image with one coordinate per field component
+    if ((floatingImage->nz > 1) != (deformationField->nu > 2))
+        NR_FATAL_ERROR("The floating image and the deformation field must both be 2D or both be 3D - the floating image is "s +
+                       (floatingImage->nz > 1 ? "3D" : "2D") + " and the deformation field has " +
+                       std::to_string(deformationField->nu) + " components");
+    if (warpedImage->nx != deformationField->nx || warpedImage->ny != deformationField->ny || warpedImage->nz != deformationField->nz)
+        NR_FATAL_ERROR("The warped image and the deformation field must be defined on the same grid - the warped image is "s +
+                       std::to_string(warpedImage->nx) + "x" + std::to_string(warpedImage->ny) + "x" + std::to_string(warpedImage->nz) +
+                       " and the deformation field " + std::to_string(deformationField->nx) + "x" + std::to_string(deformationField->ny) +
+                       "x" + std::to_string(deformationField->nz));
 
     // Define the DTI indices if required
     int dtIndicies[6];
@@ -1777,6 +1788,16 @@ void reg_resampleGradient(const nifti_image *floatingImage,
         NR_FATAL_ERROR("Input images are expected to have the same type");
     if (floatingImage->datatype != NIFTI_TYPE_FLOAT32 && floatingImage->datatype != NIFTI_TYPE_FLOAT64)
         NR_FATAL_ERROR("Input images are expected to be of type float or double");
+    // The kernel is chosen from the warped grid and reads one component per dimension from all
+    // three fields, walking the warped and deformation fields in step
+    if (floatingImage->nu != warpedImage->nu || floatingImage->nu != deformationField->nu)
+        NR_FATAL_ERROR("The floating gradient, the warped gradient and the deformation field must have the same number of components - "s +
+                       std::to_string(floatingImage->nu) + ", " + std::to_string(warpedImage->nu) + " and " +
+                       std::to_string(deformationField->nu) + " were provided");
+    if ((warpedImage->nz > 1) != (warpedImage->nu > 2))
+        NR_FATAL_ERROR("The warped gradient must have two components when 2D and three when 3D");
+    if (warpedImage->nx != deformationField->nx || warpedImage->ny != deformationField->ny || warpedImage->nz != deformationField->nz)
+        NR_FATAL_ERROR("The warped gradient and the deformation field must be defined on the same grid");
 
     std::visit([&](auto&& floImgDataType) {
         using FloImgDataType = std::decay_t<decltype(floImgDataType)>;
@@ -2098,6 +2119,20 @@ void CubicSplineImageGradient3D(const nifti_image *floatingImage,
             previous[1]--;
             previous[2]--;
 
+            // Kernel sums, for the out-of-range row/slice shortcuts below: a fully-padded row or
+            // slice must contribute exactly what per-tap padding substitution would, i.e. the
+            // padding value weighted by the product of the axis kernel sums - the derivative kernel
+            // sums to ~0, so a padded row contributes ~nothing to the derivative along that axis.
+            // (The previous shortcut added the bare padding value to every component, which made
+            // the gradient of a constant image non-zero at the boundary.)
+            FieldType sumXBasis = 0, sumXDeriv = 0, sumYBasis = 0, sumYDeriv = 0;
+            for (a = 0; a < 4; a++) {
+                sumXBasis += static_cast<FieldType>(xBasis[a]);
+                sumXDeriv += static_cast<FieldType>(xDeriv[a]);
+                sumYBasis += static_cast<FieldType>(yBasis[a]);
+                sumYDeriv += static_cast<FieldType>(yDeriv[a]);
+            }
+
             for (c = 0; c < 4; c++) {
                 Z = previous[2] + c;
                 if (-1 < Z && Z < floatingImage->nz) {
@@ -2129,9 +2164,9 @@ void CubicSplineImageGradient3D(const nifti_image *floatingImage,
                             zzTempNewValue += static_cast<FieldType>(yTempNewValue * yBasis[b]);
                         } // Y in range
                         else {
-                            xxTempNewValue += static_cast<FieldType>(paddingValue * yBasis[b]);
-                            yyTempNewValue += static_cast<FieldType>(paddingValue * yDeriv[b]);
-                            zzTempNewValue += static_cast<FieldType>(paddingValue * yBasis[b]);
+                            xxTempNewValue += static_cast<FieldType>(paddingValue * sumXDeriv * yBasis[b]);
+                            yyTempNewValue += static_cast<FieldType>(paddingValue * sumXBasis * yDeriv[b]);
+                            zzTempNewValue += static_cast<FieldType>(paddingValue * sumXBasis * yBasis[b]);
                         }
                     } // b
                     grad[0] += static_cast<FieldType>(xxTempNewValue * zBasis[c]);
@@ -2139,9 +2174,9 @@ void CubicSplineImageGradient3D(const nifti_image *floatingImage,
                     grad[2] += static_cast<FieldType>(zzTempNewValue * zDeriv[c]);
                 } // Z in range
                 else {
-                    grad[0] += static_cast<FieldType>(paddingValue * zBasis[c]);
-                    grad[1] += static_cast<FieldType>(paddingValue * zBasis[c]);
-                    grad[2] += static_cast<FieldType>(paddingValue * zDeriv[c]);
+                    grad[0] += static_cast<FieldType>(paddingValue * sumXDeriv * sumYBasis * zBasis[c]);
+                    grad[1] += static_cast<FieldType>(paddingValue * sumXBasis * sumYDeriv * zBasis[c]);
+                    grad[2] += static_cast<FieldType>(paddingValue * sumXBasis * sumYBasis * zDeriv[c]);
                 }
             } // c
 
@@ -2229,6 +2264,14 @@ void CubicSplineImageGradient2D(const nifti_image *floatingImage,
             previous[0]--;
             previous[1]--;
 
+            // See the 3D variant: a fully-padded row contributes the padding weighted by the x
+            // kernel sums, not the bare padding value
+            FieldType sumXBasis = 0, sumXDeriv = 0;
+            for (a = 0; a < 4; a++) {
+                sumXBasis += static_cast<FieldType>(xBasis[a]);
+                sumXDeriv += static_cast<FieldType>(xDeriv[a]);
+            }
+
             for (b = 0; b < 4; b++) {
                 Y = previous[1] + b;
                 yPointer = &floatingIntensity[Y * floatingImage->nx];
@@ -2252,8 +2295,8 @@ void CubicSplineImageGradient2D(const nifti_image *floatingImage,
                     grad[1] += static_cast<FieldType>(yTempNewValue * yDeriv[b]);
                 } // Y in range
                 else {
-                    grad[0] += static_cast<FieldType>(paddingValue * yBasis[b]);
-                    grad[1] += static_cast<FieldType>(paddingValue * yDeriv[b]);
+                    grad[0] += static_cast<FieldType>(paddingValue * sumXDeriv * yBasis[b]);
+                    grad[1] += static_cast<FieldType>(paddingValue * sumXBasis * yDeriv[b]);
                 }
             } // b
 

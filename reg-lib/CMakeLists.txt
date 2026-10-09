@@ -1,7 +1,12 @@
 #-----------------------------------------------------------------------------
 if(USE_CUDA)
   add_subdirectory(cuda)
-  set(NR_CUDA_LIBRARIES _reg_cuda_kernels)
+  if(NOT USE_CUDA_PLUGIN)
+    # Static CUDA: the kernels are linked into the host libraries. In plugin mode
+    # NR_CUDA_LIBRARIES stays empty - CUDA lives in the niftyreg_cuda plugin, loaded
+    # at run time - so no host target links any CUDA library.
+    set(NR_CUDA_LIBRARIES _reg_cuda_kernels)
+  endif()
 endif(USE_CUDA)
 #-----------------------------------------------------------------------------
 if(USE_OPENCL)
@@ -94,17 +99,36 @@ install(TARGETS _reg_blockMatching
 )
 set(NIFTYREG_LIBRARIES "${NIFTYREG_LIBRARIES};_reg_blockMatching")
 #-----------------------------------------------------------------------------
-add_library(_reg_compute ${NIFTYREG_LIBRARY_TYPE}
-  Compute.cpp
+add_library(_reg_content ${NIFTYREG_LIBRARY_TYPE}
   AladinContent.cpp
   Content.cpp
   DefContent.cpp
   F3dContent.cpp
+)
+target_link_libraries(_reg_content
+  _reg_blockMatching
+  _reg_resampling
+  _reg_tools
+)
+install(TARGETS _reg_content
+  RUNTIME DESTINATION lib
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+)
+set(NIFTYREG_LIBRARIES "${NIFTYREG_LIBRARIES};_reg_content")
+#-----------------------------------------------------------------------------
+add_library(_reg_compute ${NIFTYREG_LIBRARY_TYPE}
+  Compute.cpp
   Optimiser.cpp
-  Platform.cpp
   MeasureCreator.cpp
 )
-target_link_libraries(_reg_compute _reg_measure)
+target_link_libraries(_reg_compute
+  _reg_blockMatching
+  _reg_content
+  _reg_localTrans
+  _reg_measure
+  _reg_resampling
+)
 install(TARGETS _reg_compute
   RUNTIME DESTINATION lib
   LIBRARY DESTINATION lib
@@ -122,6 +146,10 @@ add_library(_reg_kernels ${NIFTYREG_LIBRARY_TYPE}
 )
 target_link_libraries(_reg_kernels
   _reg_blockMatching
+  _reg_content
+  _reg_globalTrans
+  _reg_resampling
+  _reg_tools
 )
 install(TARGETS _reg_kernels
   RUNTIME DESTINATION lib
@@ -130,12 +158,42 @@ install(TARGETS _reg_kernels
 )
 set(NIFTYREG_LIBRARIES "${NIFTYREG_LIBRARIES};_reg_kernels")
 #-----------------------------------------------------------------------------
+add_library(_reg_platform ${NIFTYREG_LIBRARY_TYPE} Platform.cpp)
+target_link_libraries(_reg_platform
+  _reg_compute
+  _reg_kernels
+  ${NR_OPENCL_LIBRARIES}
+  ${NR_CUDA_LIBRARIES}
+)
+if(USE_CUDA_PLUGIN)
+  # Platform reaches the CUDA implementation through the runtime plugin loader.
+  # NR_INSTALL_LIBDIR is the loader's last-resort search path (external programs
+  # linking static NiftyReg, whose executable lives outside the install prefix).
+  target_sources(_reg_platform PRIVATE CudaPluginLoader.cpp)
+  target_link_libraries(_reg_platform ${CMAKE_DL_LIBS})
+  target_compile_definitions(_reg_platform PRIVATE "NR_INSTALL_LIBDIR=\"${CMAKE_INSTALL_PREFIX}/lib\"")
+  # With shared host libraries, dlopen resolves a bare name through the CALLING module's
+  # search path - lib_reg_platform.so, not the executable - so in the build tree it has to
+  # reach the plugin's build directory (the property overrides the tree-wide default, hence
+  # the origin entry as well)
+  set_target_properties(_reg_platform PROPERTIES
+    BUILD_RPATH "${NR_RPATH_ORIGIN};$<TARGET_FILE_DIR:niftyreg_cuda>")
+endif()
+install(TARGETS _reg_platform
+  RUNTIME DESTINATION lib
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+)
+set(NIFTYREG_LIBRARIES "${NIFTYREG_LIBRARIES};_reg_platform")
+#-----------------------------------------------------------------------------
 ## BUILD THE ALADIN LIBRARY
 add_library(_reg_aladin ${NIFTYREG_LIBRARY_TYPE} _reg_aladin.cpp _reg_aladin_sym.cpp)
 target_link_libraries(_reg_aladin
   _reg_blockMatching
   _reg_compute
+  _reg_content
   _reg_kernels
+  _reg_platform
   _reg_localTrans
   _reg_resampling
   _reg_globalTrans
@@ -161,7 +219,9 @@ set(_reg_f3d_files
 set(_reg_f3d_libraries
   _reg_blockMatching
   _reg_compute
+  _reg_content
   _reg_kernels
+  _reg_platform
   _reg_localTrans
   _reg_globalTrans
   _reg_resampling

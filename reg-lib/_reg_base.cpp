@@ -257,6 +257,11 @@ void reg_base<T>::CheckParameters() {
                       inputReference->nz != maskImage->nz))
         NR_FATAL_ERROR("The reference and mask images have different dimension");
 
+    // The deformation field and the warped image are dimensioned from the reference image (2D when
+    // nz == 1): a 3D floating image cannot be sampled through a 2D deformation field, and a 2D floating
+    // image paired with a 3D reference yields a warped image whose voxel count does not match its grid
+    reg_checkSameDimensionality(inputReference, "reference image", inputFloating, "floating image");
+
     // Check the number of level to perform
     if (levelToPerform > 0) {
         levelToPerform = levelToPerform < levelNumber ? levelToPerform : levelNumber;
